@@ -42,8 +42,12 @@ void main(String... args) throws IOException, InterruptedException, ExecutionExc
     int targetGopInSeconds = commandLineArgs.targetGopInSeconds;
     EncoderName encoder = commandLineArgs.encoder;
     String preset = commandLineArgs.preset;
-    boolean deinterlace = commandLineArgs.deinterlace;
-    EncodingParams encodingParams = new EncodingParams(encoder, preset, deinterlace);
+    DeinterlaceAlgorithm deinterlace = commandLineArgs.deinterlaceAlgorithm;
+    DeinterlaceMode deinterlaceMode = commandLineArgs.deinterlaceMode;
+    String deinterlaceModelPath = commandLineArgs.deinterlaceModelPath;
+    DeinterlaceParams deinterlaceParams = new DeinterlaceParams(deinterlace, deinterlaceMode, deinterlaceModelPath);
+
+    EncodingParams encodingParams = new EncodingParams(encoder, preset, deinterlaceParams);
     int parallelism = commandLineArgs.parallelism;
 
     ProbeResult probeResult = ffprobe(input);
@@ -53,14 +57,19 @@ void main(String... args) throws IOException, InterruptedException, ExecutionExc
 
     validate(probeResult, sceneChanges);
 
-    int targetGopInFrames = Math.toIntExact(probeResult.frameRate().multiply(targetGopInSeconds));
-    List<Range> scenes = makeScenes(sceneChanges);
+    Rational frameRate = probeResult.frameRate();
+    if (deinterlaceParams.doublesFrameRate()) {
+        frameRate = new Rational(frameRate.numerator() * 2, frameRate.denominator());
+    }
+
+    int targetGopInFrames = Math.toIntExact(frameRate.multiply(targetGopInSeconds));
+    List<Range> scenes = makeScenes(sceneChanges, deinterlaceParams);
     IO.println("Scenes: %s".formatted(scenes));
 
     List<Range> gops = makeGops(scenes, targetGopInFrames);
     IO.println("GOPs: %s".formatted(gops));
 
-    List<EncodingResult> encodedGops = encode(gops, input, probeResult.frameRate(), encodingParams, parallelism, targetVmaf);
+    List<EncodingResult> encodedGops = encode(gops, input, frameRate, encodingParams, parallelism, targetVmaf);
     IO.println("Encoded gops: %s".formatted(encodedGops));
 
     String concatenated = concat(encodedGops, encoder, targetVmaf);
@@ -185,14 +194,15 @@ SceneChanges detectSceneChanges(String avSceneChange, String input) throws IOExc
     return sceneChanges;
 }
 
-List<Range> makeScenes(SceneChanges sceneChanges) {
+List<Range> makeScenes(SceneChanges sceneChanges, DeinterlaceParams deinterlace) {
+    int factor = deinterlace.doublesFrameRate() ? 2 : 1;
     return Stream.concat(
             IntStream.range(0, sceneChanges.sceneChanges().size() - 1)
                 .mapToObj(idx -> new Range(
-                    sceneChanges.sceneChanges().get(idx),
-                    sceneChanges.sceneChanges().get(idx + 1) - 1
+                    sceneChanges.sceneChanges().get(idx) * factor,
+                    sceneChanges.sceneChanges().get(idx + 1) * factor - 1
                 )),
-            Stream.of(new Range(sceneChanges.sceneChanges().getLast(), sceneChanges.frameCount() - 1))
+            Stream.of(new Range(sceneChanges.sceneChanges().getLast() * factor, sceneChanges.frameCount() * factor - 1))
         )
         .toList();
 }
@@ -335,7 +345,7 @@ EncodingIterationResult encode(Range range, String input, Rational frameRate, En
     return new EncodingIterationResult(encodingFilename, vmaf.pooledMetrics().get("vmaf"));
 }
 
-Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount, boolean deinterlace, Path encoding, Path vmafFilename) throws IOException, InterruptedException {
+Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount, DeinterlaceParams deinterlace, Path encoding, Path vmafFilename) throws IOException, InterruptedException {
     int timeout = 30;
 
     for (int i = 0; i < 5; ++i) {
@@ -388,7 +398,7 @@ record GopEncodingParams(
     double seek,
     String input,
     int frameCount,
-    boolean deinterlace,
+    DeinterlaceParams deinterlace,
     EncoderName encoder,
     String preset,
     int crf,
@@ -427,10 +437,17 @@ List<String> encodeCommand(GopEncodingParams params) {
     );
 }
 
-private static List<String> deinterlace(boolean deinterlace) {
-    return deinterlace
-        ? List.of("-vf", "bwdif=mode=send_frame")
-        : null;
+List<String> deinterlace(DeinterlaceParams deinterlace) {
+    if (!deinterlace.isEnabled()) {
+        return List.of();
+    }
+    DeinterlaceAlgorithm algorithm = deinterlace.algorithm();
+    DeinterlaceMode mode = deinterlace.mode();
+    String filter = switch (algorithm) {
+        case BWDIF -> "bwdif=mode=%s".formatted(algorithm.mode(mode));
+        case NNEDI -> "nnedi=weights=%s:field=%s".formatted(deinterlace.modelPath(), algorithm.mode(mode));
+    };
+    return List.of("-vf", filter);
 }
 
 List<String> command(Object... params) {
@@ -574,10 +591,29 @@ class CommandLineArgs {
         names = "-deinterlace",
         description = """
             Indicates that input video frames are interlaced (e.g. archive VHS) \
-            and have to be deinterlaced for correct encoding to progressive format""",
+            and have to be deinterlaced with specified algorithm for correct encoding to progressive format""",
         order = 7
     )
-    boolean deinterlace;
+    DeinterlaceAlgorithm deinterlaceAlgorithm;
+
+    @Parameter(
+        names = "-deinterlace-mode",
+        description = "Deinterlace mode. 'send_frame' keeps source frame rate and 'send_field' doubles frame rate",
+        order = 8
+    )
+    DeinterlaceMode deinterlaceMode = DeinterlaceMode.SEND_FIELD;
+
+    @Parameter(
+        names = "-deinterlace-model",
+        description = """
+            Path to model file if specified deinterlace algorithm requires one. \
+            Currently makes sense only for 'nnedi'.
+            The model file can be downloaded from here: \
+            https://github.com/dubhater/vapoursynth-nnedi3/blob/master/src/nnedi3_weights.bin""",
+        defaultValueDescription = "Model file with name 'nnedi3_weights.bin' expected to present at working dir",
+        order = 9
+    )
+    String deinterlaceModelPath = "nnedi3_weights.bin";
 
     @Parameter(
         names = "-parallelism",
@@ -585,7 +621,7 @@ class CommandLineArgs {
             Amount of individual GOPs that will be processed in parallel. Allows to adjust CPU utilization. \
             Optimal value depends on expected CPU utilization as well as on environment, encoder, encoder preset, \
             source video resolution, complexity, etc""",
-        order = 8
+        order = 10
     )
     int parallelism = 6;
 }
@@ -681,6 +717,42 @@ enum EncoderName {
     }
 }
 
+enum DeinterlaceAlgorithm {
+    BWDIF(DeinterlaceMode.SEND_FRAME.toString(), DeinterlaceMode.SEND_FIELD.toString()),
+    NNEDI("a", "af"),
+    ;
+    private final String sendFrameMode;
+    private final String sendFieldMode;
+
+    DeinterlaceAlgorithm(String sendFrameMode, String sendFieldMode) {
+        this.sendFrameMode = sendFrameMode;
+        this.sendFieldMode = sendFieldMode;
+    }
+
+    @Override
+    public String toString() {
+        return name().toLowerCase();
+    }
+
+    public String mode(DeinterlaceMode mode) {
+        return switch (mode) {
+            case SEND_FRAME -> sendFrameMode;
+            case SEND_FIELD -> sendFieldMode;
+        };
+    }
+}
+
+enum DeinterlaceMode {
+    SEND_FRAME,
+    SEND_FIELD,
+    ;
+
+    @Override
+    public String toString() {
+        return name().toLowerCase();
+    }
+}
+
 record ProbeResult(int frameCount, Rational frameRate) {
 }
 
@@ -694,8 +766,22 @@ record SceneChanges(
 record EncodingParams(
     EncoderName encoder,
     String preset,
-    boolean deinterlace
+    DeinterlaceParams deinterlace
 ) {
+}
+
+record DeinterlaceParams(
+    DeinterlaceAlgorithm algorithm,
+    DeinterlaceMode mode,
+    String modelPath
+) {
+    boolean isEnabled() {
+        return algorithm() != null;
+    }
+
+    boolean doublesFrameRate() {
+        return isEnabled() && mode == DeinterlaceMode.SEND_FIELD;
+    }
 }
 
 record Range(int from, int to) {
