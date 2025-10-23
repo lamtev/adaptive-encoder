@@ -20,6 +20,7 @@ dependencies {
     implementation("com.fasterxml.jackson.core:jackson-databind:2.20.0")
     implementation("com.fasterxml.jackson.core:jackson-annotations:2.20")
     implementation("org.jcommander:jcommander:3.0")
+    implementation("org.apache.commons:commons-lang3:3.19.0")
 
     testImplementation(platform("org.junit:junit-bom:5.10.0"))
     testImplementation("org.junit.jupiter:junit-jupiter")
