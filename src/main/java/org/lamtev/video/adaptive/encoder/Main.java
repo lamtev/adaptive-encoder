@@ -724,8 +724,8 @@ void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String out
 int bitrateKbs(Path file, Range frames, Rational frameRate) throws IOException {
     long bytes = Files.size(file);
     long bits = bytes * 8;
-    long seconds = Rational.divide(frames.count(), frameRate);
-    return Math.toIntExact(bits / (seconds * 1000));
+    Rational seconds = Rational.divide(frames.count(), frameRate);
+    return Math.toIntExact(bits / (seconds.numerator() * 1000 / seconds.denominator()));
 }
 
 Map<EncoderName, String> defaultPresets = Map.of(
@@ -1100,7 +1100,7 @@ record Rational(long numerator, long denominator) {
         return factor * numerator / denominator;
     }
 
-    public static long divide(long value, Rational rational) {
-        return value * rational.denominator() / rational.numerator();
+    public static Rational divide(long value, Rational rational) {
+        return new Rational(value * rational.denominator(), rational.numerator());
     }
 }
