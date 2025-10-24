@@ -350,7 +350,7 @@ Path gopDir(EncoderName encoder, Range range, int targetVmaf) {
     return Path.of("%s-range-%d-%d-vmaf%d".formatted(encoder, range.from(), range.to(), targetVmaf));
 }
 
-EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String input, Rational frameRate, EncodingParams encodingParams, int targetVmaf, Path dir) {
+EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String input, Rational frameRate, EncodingParams encodingParams, int targetVmaf, Path dir) throws IOException, InterruptedException {
     EncoderName encoder = encodingParams.encoder();
     int l = encoder.effectiveCrfRange().from();
     int r = encoder.effectiveCrfRange().to();
@@ -360,12 +360,7 @@ EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String inp
     while (l <= r) {
         int crf = (l + r) / 2;
 
-        EncodingIterationResult result;
-        try {
-            result = encode(range, input, frameRate, encodingParams, crf, dir);
-        } catch (IOException | InterruptedException e) {
-            throw new RuntimeException(e);
-        }
+        EncodingIterationResult result = encode(range, input, frameRate, encodingParams, crf, dir);
 
         double vmaf = result.vmaf().mean();
 
