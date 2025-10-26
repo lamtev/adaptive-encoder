@@ -359,7 +359,7 @@ EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String inp
     int l = encoder.effectiveCrfRange().from();
     int r = encoder.effectiveCrfRange().to();
 
-    List<EncodingResult> results = new ArrayList<>((int) Math.abs(Math.log(r - l + 1) / Math.log(2)));
+    EncodingResult result = null;
 
     while (l <= r) {
         int crf = (l + r) / 2;
@@ -368,9 +368,7 @@ EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String inp
 
         double vmaf = iterationResult.vmaf().mean();
 
-        EncodingResult result = new EncodingResult(range, iterationResult.file(), iterationResult.vmaf(), crf);
-
-        results.add(result);
+        result = new EncodingResult(range, iterationResult.file(), iterationResult.vmaf(), crf);
 
         if (vmaf >= targetVmaf + 1) {
             l = crf + 1;
@@ -382,13 +380,13 @@ EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String inp
         }
     }
 
-    if (results.isEmpty()) {
+    if (result == null) {
         throw new IllegalStateException("Unexpectedly no result");
     }
 
-    IO.println("%s [no match] crf = %d Result vmaf = %s".formatted(range, results.getLast().crf(), results.getLast().vmaf()));
+    IO.println("%s [no match] crf = %d Result vmaf = %s".formatted(range, result.crf(), result.vmaf()));
 
-    return results.getLast();
+    return result;
 }
 
 EncodingIterationResult encode(Range range, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int crf, Path dir) throws IOException, InterruptedException {
@@ -410,24 +408,13 @@ EncodingIterationResult encode(Range range, String input, ProbeResult probeResul
         encodingFilename.toString()
     );
 
-    Process encode;
-    if (true) {
-        encode = ProcessBuilder.startPipeline(List.of(
-            ffmpegDecode("%.2f".formatted(seek), input, frameCount, gopEncodingParams.deinterlace()),
-            new ProcessBuilder()
-                .command(encodeCommand_p(gopEncodingParams))
-                .redirectError(ProcessBuilder.Redirect.DISCARD)
-                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-        )).getLast();
-    } else {
-        List<String> command = encodeCommand(gopEncodingParams);
-        IO.println(String.join(" ", command));
-        encode = new ProcessBuilder()
-            .command(command)
-            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+    Process encode = ProcessBuilder.startPipeline(List.of(
+        ffmpegDecode("%.2f".formatted(seek), input, frameCount, gopEncodingParams.deinterlace()),
+        new ProcessBuilder()
+            .command(encodeCommandForPipeInput(gopEncodingParams))
             .redirectError(ProcessBuilder.Redirect.DISCARD)
-            .start();
-    }
+            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+    )).getLast();
 
     int encodeExit = encode.waitFor();
     if (encodeExit != 0) {
@@ -442,36 +429,6 @@ EncodingIterationResult encode(Range range, String input, ProbeResult probeResul
 }
 
 Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount, DeinterlaceParams deinterlace, Path encoding, Path vmafFilename) throws IOException, InterruptedException {
-    if (false) {
-        List<String> command = command(
-            "ffmpeg", "-y", "-nostdin",
-            "-r", frameRate.toString(), "-i", encoding.toString(),
-            "-r", frameRate.toString(), "-ss", seek, "-i", input, "-frames:v", frameCount,
-            "-filter_complex",
-            """
-            [0:v]null[distorted];\
-            [1:v]%s[reference];\
-            [distorted][reference]libvmaf=log_fmt=json:log_path=%s:n_threads=4\
-            """.formatted(deinterlace.algorithm() == null ? "null" : String.join(" ", deinterlace(deinterlace)), vmafFilename),
-            "-f", "null", "-"
-        );
-        IO.println(String.join(" ", command));
-        Process vmafProcess = new ProcessBuilder()
-            .command(command)
-            .redirectError(ProcessBuilder.Redirect.DISCARD)
-            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-            .start();
-
-        int exit = vmafProcess.waitFor();
-        if (exit != 0) {
-            throw new IllegalStateException("vmaf exited with: " + exit);
-        }
-
-        IO.println("vmaf finished");
-
-        return new ObjectMapper().readValue(vmafFilename.toFile(), Vmaf.class);
-    }
-
     int timeout = 30;
 
     for (int i = 0; i < 5; ++i) {
@@ -564,21 +521,14 @@ List<String> encodeCommand(GopEncodingParams params) {
     );
 }
 
-List<String> encodeCommand_p(GopEncodingParams params) {
-    String seek = "%.2f".formatted(params.seek());
-
+List<String> encodeCommandForPipeInput(GopEncodingParams params) {
     EncoderName encoder = params.encoder();
 
     return command(
         "ffmpeg", "-y",
-//        "-nostdin",
         "-hide_banner",
-//        "-ss", seek,
         "-i", "-",
-//        params.input(),
-//        "-frames:v", params.frameCount(),
         "-threads", "8",
-//        deinterlace(params.deinterlace()),
         "-an",
         "-c:v", encoder, encoder.presetOption(), params.preset(),
         "-crf", params.crf(), "-g", params.frameCount(),
@@ -826,7 +776,6 @@ record ApplicationInfo(String title, String version, String vendor) {
 }
 
 // HH:MM:SS.MS
-
 record DurationConverter() implements IStringConverter<Duration> {
     static Pattern pattern = Pattern.compile("^((?<HH>\\d+):)?((?<MM>[0-5]?\\d):)?(?<SS>[0-5]?\\d)(\\.(?<MS>\\d+))?$");
 
