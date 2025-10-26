@@ -674,11 +674,14 @@ void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String out
         double minMeanVmaf,
         double meanMeanVmaf,
         double maxMeanVmaf,
+        double minMinVmaf,
         int minBitrate,
         int meanBitrate,
         int maxBitrate,
         int minCrf,
         int maxCrf,
+        int minGop,
+        int maxGop,
         List<Gop> gops
     ) {
         record Gop(Range frames, Vmaf vmaf, int crf, int bitrateKbs) {
@@ -691,11 +694,14 @@ void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String out
     long meanVmafWeightedSum = 0;
     long meanVmafWeightsSum = 0;
     double maxMeanVmaf = encodedGops.getFirst().vmaf().mean();
+    double minMinVmaf = encodedGops.getFirst().vmaf().min();
     int minBitrate = bitrateKbs(encodedGops.getFirst().file(), encodedGops.getFirst().frames(), frameRate);
     int bitrateWeightedSum = bitrateKbs(encodedGops.getFirst().file(), encodedGops.getFirst().frames(), frameRate);
     int maxBitrate = bitrateKbs(encodedGops.getFirst().file(), encodedGops.getFirst().frames(), frameRate);
     int minCrf = encodedGops.getFirst().crf();
     int maxCrf = encodedGops.getFirst().crf();
+    int minGop = encodedGops.getFirst().frames().count();
+    int maxGop = encodedGops.getFirst().frames().count();
 
     List<Report.Gop> gops = new ArrayList<>(encodedGops.size());
 
@@ -721,6 +727,9 @@ void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String out
         if (vmaf.mean() > maxMeanVmaf) {
             maxMeanVmaf = vmaf.mean();
         }
+        if (vmaf.min() < minMinVmaf) {
+            minMinVmaf = vmaf.min();
+        }
         if (bitrateKbs < minBitrate) {
             minBitrate = bitrateKbs;
         }
@@ -734,6 +743,12 @@ void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String out
         if (gopResult.crf() > maxCrf) {
             maxCrf = gopResult.crf();
         }
+        if (frames.count() < minGop) {
+            minGop = frames.count();
+        }
+        if (frames.count() > maxGop) {
+            maxGop = frames.count();
+        }
     }
 
     Report report = new Report(
@@ -741,11 +756,14 @@ void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String out
         minMeanVmaf,
         (double) meanVmafWeightedSum / meanVmafWeightsSum,
         maxMeanVmaf,
+        minMinVmaf,
         minBitrate,
         (int) (bitrateWeightedSum / meanVmafWeightsSum),
         maxBitrate,
         minCrf,
         maxCrf,
+        minGop,
+        maxGop,
         gops
     );
 
