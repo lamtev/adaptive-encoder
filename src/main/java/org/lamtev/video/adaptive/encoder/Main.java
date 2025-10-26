@@ -5,6 +5,7 @@ import com.beust.jcommander.ParameterException;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.commons.lang3.Strings;
 import org.apache.commons.lang3.time.DurationFormatUtils;
 
@@ -769,7 +770,9 @@ void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String out
 
     Path path = Path.of(Strings.CS.removeEnd(output, ".mp4") + ".json");
 
-    new ObjectMapper().writeValue(path.toFile(), report);
+    new ObjectMapper()
+        .registerModule(new JavaTimeModule())
+        .writeValue(path.toFile(), report);
 }
 
 int bitrateKbs(Path file, Range frames, Rational frameRate) throws IOException {
