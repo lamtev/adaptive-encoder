@@ -47,7 +47,8 @@ void main(String... args) throws IOException, InterruptedException, ExecutionExc
     Input input = new Input(commandLineArgs.input, commandLineArgs.fromTime, commandLineArgs.duration);
     String output = commandLineArgs.output;
     String avSceneChange = commandLineArgs.avSceneChange;
-    int targetVmaf = commandLineArgs.targetVmaf;
+    int targetMeanVmaf = commandLineArgs.targetVmaf;
+    int targetMinVmaf = commandLineArgs.targetMinVmaf;
     int targetGopInSeconds = commandLineArgs.targetGopInSeconds;
     EncoderName encoder = commandLineArgs.encoder;
     String preset = commandLineArgs.preset;
@@ -76,9 +77,9 @@ void main(String... args) throws IOException, InterruptedException, ExecutionExc
     List<Range> gops = makeGops(scenes, targetGopInFrames);
     IO.println("GOPs: %s".formatted(gops));
 
-    List<EncodingResult> encodedGops = encode(gops, input.file(), probeResult, frameRate, encodingParams, parallelism, targetVmaf);
+    List<EncodingResult> encodedGops = encode(gops, input.file(), probeResult, frameRate, encodingParams, parallelism, targetMeanVmaf, targetMinVmaf);
 
-    String concatenated = concat(encodedGops, encoder, targetVmaf);
+    String concatenated = concat(encodedGops, encoder, targetMeanVmaf);
 
     Duration processingDuration = Duration.ofNanos(System.nanoTime() - start);
 
@@ -86,7 +87,7 @@ void main(String... args) throws IOException, InterruptedException, ExecutionExc
 
     makeReport(encodedGops, frameRate, output, processingDuration);
 
-    cleanup(gops, encodingParams, targetVmaf);
+    cleanup(gops, encodingParams, targetMeanVmaf);
 }
 
 private CommandLineArgs parseCommandLineArgs(String[] args) {
@@ -319,14 +320,14 @@ List<Range> makeGops(List<Range> scenes, int targetGopInFrames) {
         .toList();
 }
 
-List<EncodingResult> encode(List<Range> ranges, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int parallelism, int targetVmaf) throws InterruptedException, ExecutionException {
+List<EncodingResult> encode(List<Range> ranges, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int parallelism, int targetVmaf, int targetMinVmaf) throws InterruptedException, ExecutionException {
     List<EncodingResult> encodedScenes = new ArrayList<>(ranges.size());
     try (ExecutorService executorService = Executors.newFixedThreadPool(parallelism)) {
         List<Future<EncodingResult>> encodings = new ArrayList<>(ranges.size());
         for (Range range : ranges) {
             encodings.add(executorService.submit(() -> {
                 Path dir = Files.createDirectory(gopDir(encodingParams.encoder(), range, targetVmaf));
-                EncodingResult result = encodeMatchingTargetVmafUsingBinarySearch(range, input, probeResult, frameRate, encodingParams, targetVmaf, dir);
+                EncodingResult result = encodeMatchingTargetVmafUsingBinarySearch(range, input, probeResult, frameRate, encodingParams, targetVmaf, targetMinVmaf, dir);
                 try (Stream<Path> pathStream = Files.list(dir)) {
                     pathStream
                         .filter(Files::isRegularFile)
@@ -355,7 +356,7 @@ Path gopDir(EncoderName encoder, Range range, int targetVmaf) {
     return Path.of("%s-range-%d-%d-vmaf%d".formatted(encoder, range.from(), range.to(), targetVmaf));
 }
 
-EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int targetVmaf, Path dir) throws IOException, InterruptedException {
+EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int targetMeanVmaf, int targetMinVmaf, Path dir) throws IOException, InterruptedException {
     EncoderName encoder = encodingParams.encoder();
     int l = encoder.effectiveCrfRange().from();
     int r = encoder.effectiveCrfRange().to();
@@ -367,13 +368,14 @@ EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String inp
 
         EncodingIterationResult iterationResult = encode(range, input, probeResult, frameRate, encodingParams, crf, dir);
 
-        double vmaf = iterationResult.vmaf().mean();
+        double meanVmaf = iterationResult.vmaf().mean();
+        double minVmaf = iterationResult.vmaf().min();
 
         result = new EncodingResult(range, iterationResult.file(), iterationResult.vmaf(), crf);
 
-        if (vmaf >= targetVmaf + 1) {
+        if (meanVmaf >= targetMeanVmaf + 1) {
             l = crf + 1;
-        } else if (vmaf < targetVmaf) {
+        } else if (meanVmaf < targetMeanVmaf) {
             r = crf - 1;
         } else {
             IO.println("%s crf = %d Result vmaf = %s".formatted(range, crf, iterationResult.vmaf()));
@@ -409,16 +411,26 @@ EncodingIterationResult encode(Range range, String input, ProbeResult probeResul
         encodingFilename.toString()
     );
 
-    Process encode = ProcessBuilder.startPipeline(List.of(
-        ffmpegDecode("%.2f".formatted(seek), input, frameCount, gopEncodingParams.deinterlace()),
-        new ProcessBuilder()
-            .command(encodeCommandForPipeInput(gopEncodingParams))
-            .redirectError(ProcessBuilder.Redirect.DISCARD)
-            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-    )).getLast();
+    for (int i = 0; i < 3; ++i) {
+        Process encode = ProcessBuilder.startPipeline(List.of(
+            ffmpegDecode("%.2f".formatted(seek), input, frameCount, gopEncodingParams.deinterlace()),
+            new ProcessBuilder()
+                .command(encodeCommandForPipeInput(gopEncodingParams))
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+        )).getLast();
 
-    int encodeExit = encode.waitFor();
-    if (encodeExit != 0) {
+        int encodeExit = encode.waitFor();
+
+        if (encodeExit == 0) {
+            break;
+        }
+
+        if (i < 2) {
+            IO.println("Encode exited with %d. Retrying (attempt=%d)".formatted(encodeExit, i));
+            continue;
+        }
+
         throw new IllegalStateException("Encode exited with " + encodeExit);
     }
     IO.println("Encode finished");
@@ -847,8 +859,8 @@ class CommandLineArgs {
     String avSceneChange = "av-scenechange";
 
     @Parameter(
-        names = "-target-vmaf",
-        description = "Target vmaf value, encoder have to achieve",
+        names = {"-target-vmaf", "-target-mean-vmaf"},
+        description = "Target mean vmaf value, encoder have to achieve",
         order = 3
     )
     int targetVmaf = 90;
@@ -859,14 +871,14 @@ class CommandLineArgs {
             Target GOP size in seconds a.k.a. regular key-frame placement interval. \
             For shorter scenes GOPs can be less than the target value. \
             '0' means key-frames will be placed on scene changes only (even if scenes so large)""",
-        order = 4
+        order = 5
     )
     int targetGopInSeconds = 15;
 
     @Parameter(
         names = "-encoder",
         description = "Encoder to use",
-        order = 5
+        order = 6
     )
     EncoderName encoder = EncoderName.SVT_AV1;
 
@@ -876,7 +888,7 @@ class CommandLineArgs {
         defaultValueDescription = """
             Encoder specific: 'medium' for libx264 & libx265, \
             '6' for libsvtav1 & '3' (cpu-used) for libvpx-vp9""",
-        order = 6
+        order = 7
     )
     String preset = "def";
 
@@ -885,16 +897,16 @@ class CommandLineArgs {
         description = """
             Indicates that input video frames are interlaced (e.g. archive VHS) \
             and have to be deinterlaced with specified algorithm for correct encoding to progressive format""",
-        order = 7
+        order = 8
     )
     DeinterlaceAlgorithm deinterlaceAlgorithm;
 
     @Parameter(
         names = "-deinterlace-mode",
         description = "Deinterlace mode. 'send_frame' keeps source frame rate and 'send_field' doubles frame rate",
-        order = 8
+        order = 9
     )
-    DeinterlaceMode deinterlaceMode = DeinterlaceMode.SEND_FIELD;
+    DeinterlaceMode deinterlaceMode = DeinterlaceMode.SEND_FRAME;
 
     @Parameter(
         names = "-deinterlace-model",
@@ -904,7 +916,7 @@ class CommandLineArgs {
             The model file can be downloaded from here: \
             https://github.com/dubhater/vapoursynth-nnedi3/blob/master/src/nnedi3_weights.bin""",
         defaultValueDescription = "Model file with name 'nnedi3_weights.bin' expected to present at working dir",
-        order = 9
+        order = 10
     )
     String deinterlaceModelPath = "nnedi3_weights.bin";
 
@@ -914,7 +926,7 @@ class CommandLineArgs {
             Amount of individual GOPs that will be processed in parallel. Allows to adjust CPU utilization. \
             Optimal value depends on expected CPU utilization as well as on environment, encoder, encoder preset, \
             source video resolution, complexity, etc""",
-        order = 10
+        order = 11
     )
     int parallelism = 6;
 
@@ -924,7 +936,7 @@ class CommandLineArgs {
             Allows to encode only part of the video \
             starting from specified time in standard FFmpeg format: HH:MM:SS.MS""",
         converter = DurationConverter.class,
-        order = 11
+        order = 12
     )
     Duration fromTime;
 
@@ -934,7 +946,7 @@ class CommandLineArgs {
             Allows to encode only part of the video \
             ending when specified duration reached in standard FFmpeg format: HH:MM:SS.MS""",
         converter = DurationConverter.class,
-        order = 12
+        order = 13
     )
     Duration duration;
 }
