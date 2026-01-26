@@ -866,6 +866,17 @@ class CommandLineArgs {
     int targetVmaf = 90;
 
     @Parameter(
+        names = "-target-min-vmaf",
+        description = """
+            Target min vmaf value, encoder have to achieve too as well as mean vmaf value. \
+            Target min vmaf value achievement may result in higher mean vmaf value and higher bitrate\
+            """,
+        defaultValueDescription = "By default, we try to achieve only mean vmaf target value",
+        order = 4
+    )
+    int targetMinVmaf = -1;
+
+    @Parameter(
         names = "-target-gop-seconds",
         description = """
             Target GOP size in seconds a.k.a. regular key-frame placement interval. \
