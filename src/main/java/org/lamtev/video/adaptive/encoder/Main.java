@@ -411,9 +411,10 @@ EncodingIterationResult encode(Range range, String input, ProbeResult probeResul
         encodingFilename.toString()
     );
 
+    String formattedSeek = "%.2f".formatted(seek);
     for (int i = 0; i < 3; ++i) {
         Process encode = ProcessBuilder.startPipeline(List.of(
-            ffmpegDecode("%.2f".formatted(seek), input, frameCount, gopEncodingParams.deinterlace()),
+            ffmpegDecode(formattedSeek, input, frameCount, gopEncodingParams.deinterlace()),
             new ProcessBuilder()
                 .command(encodeCommandForPipeInput(gopEncodingParams))
                 .redirectError(ProcessBuilder.Redirect.DISCARD)
@@ -435,7 +436,7 @@ EncodingIterationResult encode(Range range, String input, ProbeResult probeResul
     }
     IO.println("Encode finished");
 
-    Vmaf vmaf = calculateVmaf("%.2f".formatted(seek), frameRate, input, frameCount, encodingParams.deinterlace(), encodingFilename, vmafFilename);
+    Vmaf vmaf = calculateVmaf(formattedSeek, frameRate, input, frameCount, encodingParams.deinterlace(), encodingFilename, vmafFilename);
     IO.println("%s: vmaf=%s".formatted(vmafFilename, vmaf));
 
     return new EncodingIterationResult(encodingFilename, vmaf.pooledMetrics().get("vmaf"));
@@ -445,16 +446,19 @@ Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount
     int timeout = 30;
 
     for (int i = 0; i < 5; ++i) {
+        List<String> cmd = command(
+            "ffmpeg",
+            "-y",
+            "-r", frameRate.toString(), "-i", encoding.toString(),
+            "-r", frameRate.toString(), "-i", "-",
+            "-filter_complex", "libvmaf=log_fmt=json:log_path=%s:n_threads=4".formatted(vmafFilename),
+            "-f", "null", "-"
+        );
         List<Process> vmaf = ProcessBuilder.startPipeline(List.of(
             ffmpegDecode(seek, input, frameCount, deinterlace),
             new ProcessBuilder()
                 .command(
-                    "ffmpeg",
-                    "-y",
-                    "-r", frameRate.toString(), "-i", encoding.toString(),
-                    "-r", frameRate.toString(), "-i", "-",
-                    "-filter_complex", "libvmaf=log_fmt=json:log_path=%s:n_threads=4".formatted(vmafFilename),
-                    "-f", "null", "-"
+                    cmd
                 )
                 .redirectError(ProcessBuilder.Redirect.DISCARD)
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
@@ -477,7 +481,7 @@ Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount
 
         int exit = vmaf.getLast().exitValue();
         if (exit != 0) {
-            throw new IllegalStateException("vmaf exited with: " + exit);
+            throw new IllegalStateException("[" + encoding + "] vmaf exited with: " + exit);
         }
 
         IO.println("vmaf finished");
@@ -496,7 +500,8 @@ private ProcessBuilder ffmpegDecode(String seek, String input, int frameCount, D
             "-an",
             "-f", "yuv4mpegpipe", "-"
         ))
-        .redirectError(ProcessBuilder.Redirect.DISCARD);
+        .redirectError(ProcessBuilder.Redirect.DISCARD)
+        ;
 }
 
 record GopEncodingParams(
