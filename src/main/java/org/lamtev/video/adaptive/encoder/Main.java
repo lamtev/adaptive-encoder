@@ -374,7 +374,11 @@ EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String inp
         result = new EncodingResult(range, iterationResult.file(), iterationResult.vmaf(), crf);
 
         if (meanVmaf >= targetMeanVmaf + 1) {
-            l = crf + 1;
+            if (targetMinVmaf > 0 && minVmaf < targetMinVmaf) {
+                r = crf - 1;
+            } else {
+                l = crf + 1;
+            }
         } else if (meanVmaf < targetMeanVmaf) {
             r = crf - 1;
         } else {
