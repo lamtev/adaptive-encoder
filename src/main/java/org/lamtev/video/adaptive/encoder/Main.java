@@ -6,6 +6,7 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Strings;
 import org.apache.commons.lang3.time.DurationFormatUtils;
 
@@ -22,6 +23,7 @@ import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -48,6 +50,7 @@ void main(String... args) throws IOException, InterruptedException, ExecutionExc
     Input input = new Input(commandLineArgs.input, commandLineArgs.fromTime, commandLineArgs.duration);
     String output = commandLineArgs.output;
     String avSceneChange = commandLineArgs.avSceneChange;
+    String ffmpegPath = commandLineArgs.ffmpegPath;
     int targetMeanVmaf = commandLineArgs.targetVmaf;
     int targetMinVmaf = commandLineArgs.targetMinVmaf;
     int targetGopInSeconds = commandLineArgs.targetGopInSeconds;
@@ -61,9 +64,9 @@ void main(String... args) throws IOException, InterruptedException, ExecutionExc
     EncodingParams encodingParams = new EncodingParams(encoder, preset, deinterlaceParams, commandLineArgs.denoise, commandLineArgs.pixelFormat);
     int parallelism = commandLineArgs.parallelism;
 
-    ProbeResult probeResult = ffprobe(input);
+    ProbeResult probeResult = ffprobe(input, ffmpegPath);
     IO.println("Probe result: %s".formatted(probeResult));
-    SceneChanges sceneChanges = detectSceneChanges(avSceneChange, input, probeResult);
+    SceneChanges sceneChanges = detectSceneChanges(avSceneChange, input, probeResult, ffmpegPath);
     IO.println("Scene changes: %s".formatted(sceneChanges));
 
     Rational frameRate = probeResult.frameRate();
@@ -78,13 +81,13 @@ void main(String... args) throws IOException, InterruptedException, ExecutionExc
     List<Range> gops = makeGops(scenes, targetGopInFrames);
     IO.println("GOPs: %s".formatted(gops));
 
-    List<EncodingResult> encodedGops = encode(gops, input.file(), probeResult, frameRate, encodingParams, parallelism, targetMeanVmaf, targetMinVmaf);
+    List<EncodingResult> encodedGops = encode(gops, input.file(), probeResult, frameRate, encodingParams, parallelism, targetMeanVmaf, targetMinVmaf, ffmpegPath);
 
-    String concatenated = concat(encodedGops, encoder, targetMeanVmaf);
+    String concatenated = concat(encodedGops, encoder, targetMeanVmaf, ffmpegPath);
 
     Duration processingDuration = Duration.ofNanos(System.nanoTime() - start);
 
-    mergeVideoAndAudio(concatenated, input, output);
+    mergeVideoAndAudio(concatenated, input, output, ffmpegPath);
 
     makeReport(encodedGops, frameRate, output, processingDuration);
 
@@ -144,10 +147,14 @@ ApplicationInfo applicationInfo() {
     );
 }
 
-ProbeResult ffprobe(Input input) throws IOException {
+String ffBinary(String util, String path) {
+    return StringUtils.isBlank(path) ? util : path + "/" + util;
+}
+
+ProbeResult ffprobe(Input input, String ffmpegPath) throws IOException {
     Process ffprobe = new ProcessBuilder()
         .command(command(
-            "ffprobe",
+            ffBinary("ffprobe", ffmpegPath),
             readIntervals(input),
             "-select_streams", "v",
             "-show_streams", "-count_packets",
@@ -211,7 +218,7 @@ void validate(ProbeResult probeResult, SceneChanges sceneChanges) {
     }
 }
 
-SceneChanges detectSceneChanges(String avSceneChange, Input input, ProbeResult probeResult) throws IOException, InterruptedException {
+SceneChanges detectSceneChanges(String avSceneChange, Input input, ProbeResult probeResult, String ffmpegPath) throws IOException, InterruptedException {
     String scenesJsonFile = "scenes-%s.json".formatted(UUID.randomUUID());
 
     // We read file using ffmpeg directly because av-scenechange's demuxing/decoding are buggy.
@@ -219,7 +226,7 @@ SceneChanges detectSceneChanges(String avSceneChange, Input input, ProbeResult p
     List<Process> pipeline = ProcessBuilder.startPipeline(List.of(
         new ProcessBuilder()
             .command(command(
-                "ffmpeg",
+                ffBinary("ffmpeg", ffmpegPath),
                 seek(input.from()),
                 "-i", input.file(),
                 duration(input.duration()),
@@ -321,14 +328,14 @@ List<Range> makeGops(List<Range> scenes, int targetGopInFrames) {
         .toList();
 }
 
-List<EncodingResult> encode(List<Range> ranges, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int parallelism, int targetVmaf, int targetMinVmaf) throws InterruptedException, ExecutionException {
+List<EncodingResult> encode(List<Range> ranges, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int parallelism, int targetVmaf, int targetMinVmaf, String ffmpegPath) throws InterruptedException, ExecutionException {
     List<EncodingResult> encodedScenes = new ArrayList<>(ranges.size());
     try (ExecutorService executorService = Executors.newFixedThreadPool(parallelism)) {
         List<Future<EncodingResult>> encodings = new ArrayList<>(ranges.size());
         for (Range range : ranges) {
             encodings.add(executorService.submit(() -> {
                 Path dir = Files.createDirectory(gopDir(encodingParams.encoder(), range, targetVmaf));
-                EncodingResult result = encodeMatchingTargetVmafUsingBinarySearch(range, input, probeResult, frameRate, encodingParams, targetVmaf, targetMinVmaf, dir);
+                EncodingResult result = encodeMatchingTargetVmafUsingBinarySearch(range, input, probeResult, frameRate, encodingParams, targetVmaf, targetMinVmaf, dir, ffmpegPath);
                 try (Stream<Path> pathStream = Files.list(dir)) {
                     pathStream
                         .filter(Files::isRegularFile)
@@ -357,7 +364,7 @@ Path gopDir(EncoderName encoder, Range range, int targetVmaf) {
     return Path.of("%s-range-%d-%d-vmaf%d".formatted(encoder, range.from(), range.to(), targetVmaf));
 }
 
-EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int targetMeanVmaf, int targetMinVmaf, Path dir) throws IOException, InterruptedException {
+EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int targetMeanVmaf, int targetMinVmaf, Path dir, String ffmpegPath) throws IOException, InterruptedException {
     EncoderName encoder = encodingParams.encoder();
     int l = encoder.effectiveCrfRange().from();
     int r = encoder.effectiveCrfRange().to();
@@ -367,7 +374,7 @@ EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String inp
     while (l <= r) {
         int crf = (l + r) / 2;
 
-        EncodingIterationResult iterationResult = encode(range, input, probeResult, frameRate, encodingParams, crf, dir);
+        EncodingIterationResult iterationResult = encode(range, input, probeResult, frameRate, encodingParams, crf, dir, ffmpegPath);
 
         double meanVmaf = iterationResult.vmaf().mean();
         double minVmaf = iterationResult.vmaf().min();
@@ -397,7 +404,7 @@ EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String inp
     return result;
 }
 
-EncodingIterationResult encode(Range range, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int crf, Path dir) throws IOException, InterruptedException {
+EncodingIterationResult encode(Range range, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int crf, Path dir, String ffmpegPath) throws IOException, InterruptedException {
     String resultFilename = "%d-%d-crf%d-%s".formatted(range.from(), range.to(), crf, encodingParams.encoder());
     Path encodingFilename = dir.resolve("result-%s.mp4".formatted(resultFilename));
     Path vmafFilename = dir.resolve("vmaf-%s.json".formatted(resultFilename));
@@ -420,9 +427,9 @@ EncodingIterationResult encode(Range range, String input, ProbeResult probeResul
     String formattedSeek = "%.2f".formatted(seek);
     for (int i = 0; i < 3; ++i) {
         Process encode = ProcessBuilder.startPipeline(List.of(
-            ffmpegDecode(formattedSeek, input, frameCount, gopEncodingParams.deinterlace(), encodingParams),
+            ffmpegDecode(formattedSeek, input, frameCount, gopEncodingParams.deinterlace(), encodingParams, ffmpegPath),
             new ProcessBuilder()
-                .command(encodeCommandForPipeInput(gopEncodingParams))
+                .command(encodeCommandForPipeInput(gopEncodingParams, ffmpegPath))
                 .redirectError(ProcessBuilder.Redirect.DISCARD)
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
         )).getLast();
@@ -442,18 +449,18 @@ EncodingIterationResult encode(Range range, String input, ProbeResult probeResul
     }
     IO.println("Encode finished");
 
-    Vmaf vmaf = calculateVmaf(formattedSeek, frameRate, input, frameCount, encodingParams.deinterlace(), encodingParams, encodingFilename, vmafFilename);
+    Vmaf vmaf = calculateVmaf(formattedSeek, frameRate, input, frameCount, encodingParams.deinterlace(), encodingParams, encodingFilename, vmafFilename, ffmpegPath);
     IO.println("%s: vmaf=%s".formatted(vmafFilename, vmaf));
 
     return new EncodingIterationResult(encodingFilename, vmaf.pooledMetrics().get("vmaf"));
 }
 
-Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount, DeinterlaceParams deinterlace, EncodingParams encodingParams, Path encoding, Path vmafFilename) throws IOException, InterruptedException {
+Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount, DeinterlaceParams deinterlace, EncodingParams encodingParams, Path encoding, Path vmafFilename, String ffmpegPath) throws IOException, InterruptedException {
     int timeout = 30;
 
     for (int i = 0; i < 5; ++i) {
         List<String> cmd = command(
-            "ffmpeg",
+            ffBinary("ffmpeg", ffmpegPath),
             "-y",
             "-r", frameRate.toString(), "-i", encoding.toString(),
             "-r", frameRate.toString(), "-i", "-",
@@ -461,7 +468,7 @@ Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount
             "-f", "null", "-"
         );
         List<Process> vmaf = ProcessBuilder.startPipeline(List.of(
-            ffmpegDecode(seek, input, frameCount, deinterlace, encodingParams),
+            ffmpegDecode(seek, input, frameCount, deinterlace, encodingParams, ffmpegPath),
             new ProcessBuilder()
                 .command(
                     cmd
@@ -498,10 +505,10 @@ Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount
     throw new InterruptedException("Attempts left");
 }
 
-private ProcessBuilder ffmpegDecode(String seek, String input, int frameCount, DeinterlaceParams deinterlace, EncodingParams encoding) {
+private ProcessBuilder ffmpegDecode(String seek, String input, int frameCount, DeinterlaceParams deinterlace, EncodingParams encoding, String ffmpegPath) {
     return new ProcessBuilder()
         .command(command(
-            "ffmpeg", "-y", "-nostdin", "-ss", seek, "-i", input, "-frames:v", frameCount,
+            ffBinary("ffmpeg", ffmpegPath), "-y", "-nostdin", "-ss", seek, "-i", input, "-frames:v", frameCount,
             filters(deinterlace, encoding),
             "-an",
             "-f", "yuv4mpegpipe", "-"
@@ -558,36 +565,45 @@ List<String> encodeCommand(GopEncodingParams params) {
 //        deinterlace(params.deinterlace()),
         "-an",
         "-c:v", encoder, encoder.presetOption(), params.preset(),
-        "-crf", params.crf(), "-g", params.frameCount(),
-        encoderSpecificParams(encoder),
+        encoder.crfOption(), params.crf(), "-g", params.frameCount(),
+        encoderSpecificParams(encoder, params.frameCount()),
         extraFfmpegParams(encoder, params.pixelFormat()),
         "-f", "mp4", params.output()
     );
 }
 
-List<String> encodeCommandForPipeInput(GopEncodingParams params) {
+List<String> encodeCommandForPipeInput(GopEncodingParams params, String ffmpegPath) {
     EncoderName encoder = params.encoder();
 
     return command(
-        "ffmpeg", "-y",
+        ffBinary("ffmpeg", ffmpegPath), "-y",
         "-hide_banner",
         "-i", "-",
         "-threads", "8",
         "-an",
         "-c:v", encoder, encoder.presetOption(), params.preset(),
-        "-crf", params.crf(), "-g", params.frameCount(),
-        encoderSpecificParams(encoder),
+        encoder.crfOption(), params.crf(), "-g", params.frameCount(),
+        encoderSpecificParams(encoder, params.frameCount()),
         extraFfmpegParams(encoder, params.pixelFormat()),
         "-f", "mp4", params.output()
     );
 }
 
-List<String> encoderSpecificParams(EncoderName encoder) {
-    if (encoder.encoderSpecificParamsOption() == null || encoder.encoderSpecificParams().isEmpty()) {
+List<String> encoderSpecificParams(EncoderName encoder, int gopInFrames) {
+    if (encoder.encoderSpecificParamsOption() == null) {
         return List.of();
     }
 
-    String encoderSpecificParams = encoder.encoderSpecificParams()
+    Map<String, String> gopParam = encoder.gopEncoderSpecificParams(gopInFrames);
+
+    if (encoder.encoderSpecificParams().isEmpty() && gopParam.isEmpty()) {
+        return List.of();
+    }
+
+    Map<String, String> params = new HashMap<>(encoder.encoderSpecificParams());
+    params.putAll(gopParam);
+
+    String encoderSpecificParams = params
         .entrySet()
         .stream()
         .map(e -> "%s=%s".formatted(e.getKey(), e.getValue()))
@@ -625,7 +641,7 @@ List<String> command(Object... params) {
         .toList();
 }
 
-String concat(List<EncodingResult> encodedGops, EncoderName encoder, int targetVmaf) throws IOException, InterruptedException {
+String concat(List<EncodingResult> encodedGops, EncoderName encoder, int targetVmaf, String ffmpegPath) throws IOException, InterruptedException {
     String concatInput = encodedGops.stream()
         .map(EncodingResult::file)
         .map("file '%s'"::formatted)
@@ -639,7 +655,7 @@ String concat(List<EncodingResult> encodedGops, EncoderName encoder, int targetV
 
     String concatenated = "concatenated-%s-vmaf%d.mp4".formatted(encoder, targetVmaf);
     Process concat = new ProcessBuilder()
-        .command("ffmpeg", "-y", "-nostdin", "-hide_banner",
+        .command(ffBinary("ffmpeg", ffmpegPath), "-y", "-nostdin", "-hide_banner",
             "-f", "concat",
             "-safe", "0",
             "-i", concatTxtFilename,
@@ -657,9 +673,9 @@ String concat(List<EncodingResult> encodedGops, EncoderName encoder, int targetV
     return concatenated;
 }
 
-void mergeVideoAndAudio(String concatenated, Input source, String output) throws IOException, InterruptedException {
+void mergeVideoAndAudio(String concatenated, Input source, String output, String ffmpegPath) throws IOException, InterruptedException {
     Process merge = new ProcessBuilder()
-        .command(command("ffmpeg", "-y", "-nostdin", "-hide_banner",
+        .command(command(ffBinary("ffmpeg", ffmpegPath), "-y", "-nostdin", "-hide_banner",
             "-i", concatenated,
             seek(source.from()),
             duration(source.duration()),
@@ -820,7 +836,8 @@ Map<EncoderName, String> defaultPresets = Map.of(
     EncoderName.X264, "medium",
     EncoderName.X265, "medium",
     EncoderName.SVT_AV1, "6",
-    EncoderName.VPX_VP9, "3"
+    EncoderName.VPX_VP9, "3",
+    EncoderName.VV_ENC, "medium"
 );
 
 record ApplicationInfo(String title, String version, String vendor) {
@@ -994,12 +1011,18 @@ class CommandLineArgs {
         order = 16
     )
     PixelFormat pixelFormat = PixelFormat.AUTO;
+
+    @Parameter(
+        names = "-ffmpeg-path",
+        order = 17
+    )
+    String ffmpegPath;
 }
 
 enum EncoderName {
     X264(
         "libx264",
-        new Range(17, 51),
+        "-crf", new Range(17, 51),
         "-preset",
         Map.of(),
         "-x264-params",
@@ -1008,7 +1031,7 @@ enum EncoderName {
 
     X265(
         "libx265",
-        new Range(17, 51),
+        "-crf", new Range(17, 51),
         "-preset",
         Map.of("-tag:v", "hvc1"),
         "-x265-params",
@@ -1017,7 +1040,7 @@ enum EncoderName {
 
     VPX_VP9(
         "libvpx-vp9",
-        new Range(15, 63),
+        "-crf", new Range(15, 63),
         "-cpu-used",
         Map.of(
             "-deadline", "good",
@@ -1030,7 +1053,7 @@ enum EncoderName {
 
     SVT_AV1(
         "libsvtav1",
-        new Range(16, 63),
+        "-crf", new Range(16, 63),
         "-preset",
         Map.of(),
         "-svtav1-params",
@@ -1039,9 +1062,28 @@ enum EncoderName {
             "tune", "0"
         )
     ),
+
+    VV_ENC(
+        "libvvenc",
+        "-qp", new Range(16, 63),
+        "-preset",
+        Map.of(),
+        "-vvenc-params",
+        Map.of("decodingrefreshtype", "idr")
+    ) {
+        @Override
+        public Map<String, String> gopEncoderSpecificParams(int gopInFrames) {
+            return Map.of(
+                "intraperiod", Integer.toString(gopInFrames),
+                "minintradistance", Integer.toString(gopInFrames)
+            );
+        }
+    }
+
     ;
 
     private final String lib;
+    private final String crfOption;
     private final Range effectiveCrfRange;
     private final String presetOption;
     private final Map<String, String> extraFfmpegParams;
@@ -1050,6 +1092,7 @@ enum EncoderName {
 
     EncoderName(
         String lib,
+        String crfOption,
         Range effectiveCrfRange,
         String presetOption,
         Map<String, String> extraFfmpegParams,
@@ -1057,6 +1100,7 @@ enum EncoderName {
         Map<String, String> encoderSpecificParams
     ) {
         this.lib = lib;
+        this.crfOption = crfOption;
         this.effectiveCrfRange = effectiveCrfRange;
         this.presetOption = presetOption;
         this.extraFfmpegParams = extraFfmpegParams;
@@ -1067,6 +1111,10 @@ enum EncoderName {
     @Override
     public String toString() {
         return lib;
+    }
+
+    String crfOption() {
+        return crfOption;
     }
 
     Range effectiveCrfRange() {
@@ -1087,6 +1135,10 @@ enum EncoderName {
 
     public Map<String, String> encoderSpecificParams() {
         return encoderSpecificParams;
+    }
+
+    public Map<String, String> gopEncoderSpecificParams(int gopInFrames) {
+        return Map.of();
     }
 }
 
