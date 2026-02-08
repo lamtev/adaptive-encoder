@@ -22,6 +22,7 @@ import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -57,7 +58,7 @@ void main(String... args) throws IOException, InterruptedException, ExecutionExc
     String deinterlaceModelPath = commandLineArgs.deinterlaceModelPath;
     DeinterlaceParams deinterlaceParams = new DeinterlaceParams(deinterlace, deinterlaceMode, deinterlaceModelPath);
 
-    EncodingParams encodingParams = new EncodingParams(encoder, preset, deinterlaceParams);
+    EncodingParams encodingParams = new EncodingParams(encoder, preset, deinterlaceParams, commandLineArgs.denoise, commandLineArgs.pixelFormat);
     int parallelism = commandLineArgs.parallelism;
 
     ProbeResult probeResult = ffprobe(input);
@@ -205,8 +206,8 @@ String durationToString(Duration duration) {
 
 void validate(ProbeResult probeResult, SceneChanges sceneChanges) {
     if (probeResult.frameCount() != sceneChanges.frameCount()) {
-        IO.println("ffprobe and av-scenechange result mismatch: ffprobe.frameCount=%d != av-scenechange.frameCount=%d".formatted(probeResult.frameCount(), sceneChanges.frameCount()));
-//        throw new IllegalStateException("ffprobe and av-scenechange result mismatch: ffprobe.frameCount=%d != av-scenechange.frameCount=%d".formatted(probeResult.frameCount(), sceneChanges.frameCount()));
+//        IO.println("ffprobe and av-scenechange result mismatch: ffprobe.frameCount=%d != av-scenechange.frameCount=%d".formatted(probeResult.frameCount(), sceneChanges.frameCount()));
+        throw new IllegalStateException("ffprobe and av-scenechange result mismatch: ffprobe.frameCount=%d != av-scenechange.frameCount=%d".formatted(probeResult.frameCount(), sceneChanges.frameCount()));
     }
 }
 
@@ -410,6 +411,7 @@ EncodingIterationResult encode(Range range, String input, ProbeResult probeResul
         frameCount,
         encodingParams.deinterlace(),
         encodingParams.encoder(),
+        encodingParams.pixelFormat(),
         encodingParams.preset(),
         crf,
         encodingFilename.toString()
@@ -418,7 +420,7 @@ EncodingIterationResult encode(Range range, String input, ProbeResult probeResul
     String formattedSeek = "%.2f".formatted(seek);
     for (int i = 0; i < 3; ++i) {
         Process encode = ProcessBuilder.startPipeline(List.of(
-            ffmpegDecode(formattedSeek, input, frameCount, gopEncodingParams.deinterlace()),
+            ffmpegDecode(formattedSeek, input, frameCount, gopEncodingParams.deinterlace(), encodingParams),
             new ProcessBuilder()
                 .command(encodeCommandForPipeInput(gopEncodingParams))
                 .redirectError(ProcessBuilder.Redirect.DISCARD)
@@ -440,13 +442,13 @@ EncodingIterationResult encode(Range range, String input, ProbeResult probeResul
     }
     IO.println("Encode finished");
 
-    Vmaf vmaf = calculateVmaf(formattedSeek, frameRate, input, frameCount, encodingParams.deinterlace(), encodingFilename, vmafFilename);
+    Vmaf vmaf = calculateVmaf(formattedSeek, frameRate, input, frameCount, encodingParams.deinterlace(), encodingParams, encodingFilename, vmafFilename);
     IO.println("%s: vmaf=%s".formatted(vmafFilename, vmaf));
 
     return new EncodingIterationResult(encodingFilename, vmaf.pooledMetrics().get("vmaf"));
 }
 
-Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount, DeinterlaceParams deinterlace, Path encoding, Path vmafFilename) throws IOException, InterruptedException {
+Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount, DeinterlaceParams deinterlace, EncodingParams encodingParams, Path encoding, Path vmafFilename) throws IOException, InterruptedException {
     int timeout = 30;
 
     for (int i = 0; i < 5; ++i) {
@@ -459,7 +461,7 @@ Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount
             "-f", "null", "-"
         );
         List<Process> vmaf = ProcessBuilder.startPipeline(List.of(
-            ffmpegDecode(seek, input, frameCount, deinterlace),
+            ffmpegDecode(seek, input, frameCount, deinterlace, encodingParams),
             new ProcessBuilder()
                 .command(
                     cmd
@@ -496,16 +498,35 @@ Vmaf calculateVmaf(String seek, Rational frameRate, String input, int frameCount
     throw new InterruptedException("Attempts left");
 }
 
-private ProcessBuilder ffmpegDecode(String seek, String input, int frameCount, DeinterlaceParams deinterlace) {
+private ProcessBuilder ffmpegDecode(String seek, String input, int frameCount, DeinterlaceParams deinterlace, EncodingParams encoding) {
     return new ProcessBuilder()
         .command(command(
             "ffmpeg", "-y", "-nostdin", "-ss", seek, "-i", input, "-frames:v", frameCount,
-            deinterlace(deinterlace),
+            filters(deinterlace, encoding),
             "-an",
             "-f", "yuv4mpegpipe", "-"
         ))
         .redirectError(ProcessBuilder.Redirect.DISCARD)
         ;
+}
+
+private List<String> filters(DeinterlaceParams deinterlace, EncodingParams encoding) {
+    if (deinterlace == null || !deinterlace.isEnabled()) {
+        return List.of();
+    }
+
+    DeinterlaceAlgorithm algorithm = deinterlace.algorithm();
+    DeinterlaceMode mode = deinterlace.mode();
+    String filter = switch (algorithm) {
+        case BWDIF -> "bwdif=mode=%s".formatted(algorithm.mode(mode));
+        case NNEDI -> "nnedi=weights=%s:field=%s".formatted(deinterlace.modelPath(), algorithm.mode(mode));
+    };
+
+    if (encoding.denoise()) {
+        filter += ",hqdn3d";
+    }
+
+    return List.of("-vf", filter);
 }
 
 record GopEncodingParams(
@@ -514,6 +535,7 @@ record GopEncodingParams(
     int frameCount,
     DeinterlaceParams deinterlace,
     EncoderName encoder,
+    PixelFormat pixelFormat,
     String preset,
     int crf,
     String output
@@ -533,12 +555,12 @@ List<String> encodeCommand(GopEncodingParams params) {
         "-i", params.input(),
         "-frames:v", params.frameCount(),
         "-threads", "8",
-        deinterlace(params.deinterlace()),
+//        deinterlace(params.deinterlace()),
         "-an",
         "-c:v", encoder, encoder.presetOption(), params.preset(),
         "-crf", params.crf(), "-g", params.frameCount(),
         encoderSpecificParams(encoder),
-        getExtraFfmpegParams(encoder),
+        extraFfmpegParams(encoder, params.pixelFormat()),
         "-f", "mp4", params.output()
     );
 }
@@ -555,7 +577,7 @@ List<String> encodeCommandForPipeInput(GopEncodingParams params) {
         "-c:v", encoder, encoder.presetOption(), params.preset(),
         "-crf", params.crf(), "-g", params.frameCount(),
         encoderSpecificParams(encoder),
-        getExtraFfmpegParams(encoder),
+        extraFfmpegParams(encoder, params.pixelFormat()),
         "-f", "mp4", params.output()
     );
 }
@@ -574,25 +596,16 @@ List<String> encoderSpecificParams(EncoderName encoder) {
     return List.of(encoder.encoderSpecificParamsOption(), encoderSpecificParams);
 }
 
-List<String> getExtraFfmpegParams(EncoderName encoder) {
-    return encoder.extraFfmpegParams()
+List<String> extraFfmpegParams(EncoderName encoder, PixelFormat pixelFormat) {
+    Map<String, String> params = new LinkedHashMap<>(encoder.extraFfmpegParams());
+    if (pixelFormat != PixelFormat.AUTO) {
+        params.put("-pix_fmt", pixelFormat.toString());
+    }
+    return params
         .entrySet()
         .stream()
         .flatMap(e -> Stream.of(e.getKey(), e.getValue()))
         .toList();
-}
-
-List<String> deinterlace(DeinterlaceParams deinterlace) {
-    if (deinterlace == null || !deinterlace.isEnabled()) {
-        return List.of();
-    }
-    DeinterlaceAlgorithm algorithm = deinterlace.algorithm();
-    DeinterlaceMode mode = deinterlace.mode();
-    String filter = switch (algorithm) {
-        case BWDIF -> "bwdif=mode=%s,hqdn3d".formatted(algorithm.mode(mode));
-        case NNEDI -> "nnedi=weights=%s:field=%s,hqdn3d".formatted(deinterlace.modelPath(), algorithm.mode(mode));
-    };
-    return List.of("-vf", filter);
 }
 
 List<String> command(Object... params) {
@@ -969,6 +982,18 @@ class CommandLineArgs {
         order = 13
     )
     Duration duration;
+
+    @Parameter(
+        names = "-denoise",
+        order = 15
+    )
+    boolean denoise;
+
+    @Parameter(
+        names = "-pix-fmt",
+        order = 16
+    )
+    PixelFormat pixelFormat = PixelFormat.AUTO;
 }
 
 enum EncoderName {
@@ -1009,7 +1034,10 @@ enum EncoderName {
         "-preset",
         Map.of(),
         "-svtav1-params",
-        Map.of("lookahead", "120")
+        Map.of(
+            "lookahead", "120",
+            "tune", "0"
+        )
     ),
     ;
 
@@ -1118,7 +1146,9 @@ record SceneChanges(
 record EncodingParams(
     EncoderName encoder,
     String preset,
-    DeinterlaceParams deinterlace
+    DeinterlaceParams deinterlace,
+    boolean denoise,
+    PixelFormat pixelFormat
 ) {
 }
 
@@ -1181,5 +1211,17 @@ record Rational(long numerator, long denominator) {
 
     public static Rational divide(long value, Rational rational) {
         return new Rational(value * rational.denominator(), rational.numerator());
+    }
+}
+
+enum PixelFormat {
+    AUTO,
+    YUV420P,
+    YUV420P10LE,
+    ;
+
+    @Override
+    public String toString() {
+        return name().toLowerCase();
     }
 }
