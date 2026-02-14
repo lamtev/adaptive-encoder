@@ -4,6 +4,7 @@ import com.beust.jcommander.Parameter;
 import com.beust.jcommander.ParameterException;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonValue;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.commons.lang3.StringUtils;
@@ -15,12 +16,16 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.Reader;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -41,31 +46,135 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
+import java.util.zip.CRC32C;
+import java.util.zip.Checksum;
 
 void main(String... args) throws IOException, InterruptedException, ExecutionException {
-    long start = System.nanoTime();
-
     CommandLineArgs commandLineArgs = parseCommandLineArgs(args);
 
-    Input input = new Input(commandLineArgs.input, commandLineArgs.fromTime, commandLineArgs.duration);
-    String output = commandLineArgs.output;
-    String avSceneChange = commandLineArgs.avSceneChange;
-    String ffmpegPath = commandLineArgs.ffmpegPath;
-    int targetMeanVmaf = commandLineArgs.targetVmaf;
-    int targetMinVmaf = commandLineArgs.targetMinVmaf;
-    int targetGopInSeconds = commandLineArgs.targetGopInSeconds;
-    EncoderName encoder = commandLineArgs.encoder;
-    String preset = commandLineArgs.preset;
-    DeinterlaceAlgorithm deinterlace = commandLineArgs.deinterlaceAlgorithm;
-    DeinterlaceMode deinterlaceMode = commandLineArgs.deinterlaceMode;
-    String deinterlaceModelPath = commandLineArgs.deinterlaceModelPath;
+    Config config = toConfig(commandLineArgs);
+
+    Path configPath = Path.of(CONFIG_JSON);
+    if (Files.exists(configPath)) {
+        String confString;
+        try {
+            confString = Files.readString(configPath);
+        } catch (IOException e) {
+            System.err.println("Unable to resume: no config file found");
+            Runtime.getRuntime().halt(-2);
+            return;
+        }
+        Conf conf;
+        try {
+            conf = OBJECT_MAPPER.readValue(confString, Conf.class);
+        } catch (IOException e) {
+            System.err.println("Unable to resume: corrupted config file");
+            Runtime.getRuntime().halt(-3);
+            return;
+        }
+        int actualCrc32c = calculateCrc32c(conf.config());
+        if (actualCrc32c != conf.checksum()) {
+            System.err.println("Unable to resume: intermediate result files have been modified");
+            Runtime.getRuntime().halt(-4);
+        }
+
+        if (!config.equals(conf.config())) {
+            System.err.println("Unable to resume: current config differs from one at previous iteration");
+            Runtime.getRuntime().halt(-5);
+        }
+
+        doEncode(conf.config());
+        return;
+    }
+
+    int value = calculateCrc32c(config);
+
+    String json = OBJECT_MAPPER.writeValueAsString(new Conf(config, value, Instant.now()));
+    Files.writeString(
+        Path.of(CONFIG_JSON),
+        json,
+        StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING
+    );
+
+    doEncode(config);
+}
+
+private static Config toConfig(CommandLineArgs commandLineArgs) {
+    return new Config(
+        commandLineArgs.input,
+        commandLineArgs.output,
+        commandLineArgs.avSceneChange,
+        commandLineArgs.targetVmaf,
+        commandLineArgs.targetMinVmaf,
+        commandLineArgs.targetGopInSeconds,
+        commandLineArgs.encoder,
+        commandLineArgs.preset,
+        commandLineArgs.deinterlaceAlgorithm,
+        commandLineArgs.deinterlaceMode,
+        commandLineArgs.deinterlaceModelPath,
+        commandLineArgs.parallelism,
+        commandLineArgs.fromTime,
+        commandLineArgs.duration,
+        commandLineArgs.denoise,
+        commandLineArgs.pixelFormat,
+        commandLineArgs.ffmpegPath
+    );
+}
+
+private static int calculateCrc32c(Config config) {
+    ByteBuffer buf = ByteBuffer.allocate(10 * 1024)
+        .put(config.input().getBytes(StandardCharsets.UTF_8))
+        .put(config.output().getBytes(StandardCharsets.UTF_8))
+        .put(config.avSceneChange().getBytes(StandardCharsets.UTF_8))
+        .putInt(config.targetVmaf())
+        .putInt(config.targetMinVmaf())
+        .putInt(config.targetGopInSeconds())
+        .put(config.encoder().toString().getBytes(StandardCharsets.UTF_8))
+        .put(config.preset().getBytes(StandardCharsets.UTF_8))
+        .put(config.deinterlaceAlgorithm().toString().getBytes(StandardCharsets.UTF_8))
+        .put(config.deinterlaceMode().toString().getBytes(StandardCharsets.UTF_8))
+        .put(config.deinterlaceModelPath().getBytes(StandardCharsets.UTF_8))
+        .putInt(config.parallelism())
+        .put(config.denoise() ? Byte.MAX_VALUE : Byte.MIN_VALUE)
+        .put(config.pixelFormat().toString().getBytes(StandardCharsets.UTF_8))
+        ;
+    Optional.ofNullable(config.fromTime())
+        .ifPresent(fromTime -> buf.putLong(fromTime.toMillis()));
+    Optional.ofNullable(config.duration())
+        .ifPresent(duration -> buf.putLong(duration.toMillis()));
+    Optional.ofNullable(config.ffmpegPath())
+        .ifPresent(ffmpegPath -> buf.put(ffmpegPath.getBytes(StandardCharsets.UTF_8)));
+
+    Checksum crc32c = new CRC32C();
+    crc32c.update(buf);
+
+    return (int) crc32c.getValue();
+}
+
+private void doEncode(Config config) throws IOException, InterruptedException, ExecutionException {
+    Instant start = Instant.now();
+    Input input = new Input(config.input(), config.fromTime(), config.duration());
+    String output = config.output();
+    String avSceneChange = config.avSceneChange();
+    String ffmpegPath = config.ffmpegPath();
+    int targetMeanVmaf = config.targetVmaf();
+    int targetMinVmaf = config.targetMinVmaf();
+    int targetGopInSeconds = config.targetGopInSeconds();
+    EncoderName encoder = config.encoder();
+    String preset = config.preset();
+    DeinterlaceAlgorithm deinterlace = config.deinterlaceAlgorithm();
+    DeinterlaceMode deinterlaceMode = config.deinterlaceMode();
+    String deinterlaceModelPath = config.deinterlaceModelPath();
     DeinterlaceParams deinterlaceParams = new DeinterlaceParams(deinterlace, deinterlaceMode, deinterlaceModelPath);
 
-    EncodingParams encodingParams = new EncodingParams(encoder, preset, deinterlaceParams, commandLineArgs.denoise, commandLineArgs.pixelFormat);
-    int parallelism = commandLineArgs.parallelism;
+    EncodingParams encodingParams = new EncodingParams(encoder, preset, deinterlaceParams, config.denoise(), config.pixelFormat());
+    int parallelism = config.parallelism();
 
     ProbeResult probeResult = ffprobe(input, ffmpegPath);
+    Duration probeDuration = Duration.between(start, Instant.now());
     IO.println("Probe result: %s".formatted(probeResult));
+
+    start = Instant.now();
     SceneChanges sceneChanges = detectSceneChanges(avSceneChange, input, probeResult, ffmpegPath);
     IO.println("Scene changes: %s".formatted(sceneChanges));
 
@@ -80,16 +189,21 @@ void main(String... args) throws IOException, InterruptedException, ExecutionExc
 
     List<Range> gops = makeGops(scenes, targetGopInFrames);
     IO.println("GOPs: %s".formatted(gops));
+    Duration sceneDetectionDuration = Duration.between(start, Instant.now());
 
     List<EncodingResult> encodedGops = encode(gops, input.file(), probeResult, frameRate, encodingParams, parallelism, targetMeanVmaf, targetMinVmaf, ffmpegPath);
 
+    Duration encodingDuration = encodedGops.stream().map(EncodingResult::processingDuration).reduce(Duration.ZERO, Duration::plus);
+
+    start = Instant.now();
     String concatenated = concat(encodedGops, encoder, targetMeanVmaf, ffmpegPath);
+    Duration concatDuration = Duration.between(start, Instant.now());
 
-    Duration processingDuration = Duration.ofNanos(System.nanoTime() - start);
-
+    start = Instant.now();
     mergeVideoAndAudio(concatenated, input, output, ffmpegPath);
+    Duration mergeDuration = Duration.between(start, Instant.now());
 
-    makeReport(encodedGops, frameRate, output, processingDuration);
+    makeReport(config, encodedGops, frameRate, output, probeDuration, sceneDetectionDuration, encodingDuration, concatDuration, mergeDuration);
 
     cleanup(gops, encodingParams, targetMeanVmaf);
 }
@@ -328,15 +442,78 @@ List<Range> makeGops(List<Range> scenes, int targetGopInFrames) {
         .toList();
 }
 
+static ThreadLocal<Checksum> crc32c = ThreadLocal.withInitial(CRC32C::new);
+
+static Checksum crc32c() {
+    Checksum checksum = crc32c.get();
+    checksum.reset();
+    return checksum;
+}
+
 List<EncodingResult> encode(List<Range> ranges, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int parallelism, int targetVmaf, int targetMinVmaf, String ffmpegPath) throws InterruptedException, ExecutionException {
     List<EncodingResult> encodedScenes = new ArrayList<>(ranges.size());
     try (ExecutorService executorService = Executors.newFixedThreadPool(parallelism)) {
         List<Future<EncodingResult>> encodings = new ArrayList<>(ranges.size());
         for (Range range : ranges) {
             encodings.add(executorService.submit(() -> {
-                Path dir = Files.createDirectory(gopDir(encodingParams.encoder(), range, targetVmaf));
-                EncodingResult result = encodeMatchingTargetVmafUsingBinarySearch(range, input, probeResult, frameRate, encodingParams, targetVmaf, targetMinVmaf, dir, ffmpegPath);
-                try (Stream<Path> pathStream = Files.list(dir)) {
+                Path gopDir = gopDir(encodingParams.encoder(), encodingParams.preset(), range, targetVmaf);
+                if (!Files.exists(gopDir)) {
+                    Files.createDirectory(gopDir);
+                } else if (!Files.isDirectory(gopDir)) {
+                    throw new IllegalStateException();
+                }
+
+                Path doneFile = gopDir.resolve("done.json");
+                if (Files.exists(doneFile)) {
+                    String doneString = Files.readString(doneFile);
+                    Done done = OBJECT_MAPPER.readValue(doneString, Done.class);
+                    String resultFilename = "%d-%d-crf%d-%s".formatted(range.from(), range.to(), done.crf(), encodingParams.encoder());
+                    Path encodingFilename = gopDir.resolve("result-%s.mp4".formatted(resultFilename));
+
+                    if (Files.size(encodingFilename) != done.encodingSize()) {
+                        throw new IllegalStateException();
+                    }
+
+                    try (FileChannel channel = FileChannel.open(encodingFilename, StandardOpenOption.READ)) {
+                        MappedByteBuffer map = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
+                        Checksum checksum = crc32c();
+                        checksum.update(map);
+                        int encodingChecksum = (int)(checksum.getValue());
+                        if (done.encodingChecksum() != encodingChecksum) {
+                            throw new IllegalStateException();
+                        }
+                    }
+
+                    ByteBuffer buf = ByteBuffer.allocate(40)
+                        .putInt(done.crf())
+                        .putDouble(done.vmaf().min())
+                        .putDouble(done.vmaf().mean())
+                        .putDouble(done.vmaf().harmonicMean())
+                        .putLong(done.processingDuration().toMillis());
+
+                    Checksum checksum = crc32c();
+                    checksum.update(buf);
+                    if (checksum.getValue() != done.paramsChecksum()) {
+                        throw new IllegalStateException();
+                    }
+
+                    return new EncodingResult(range, encodingFilename, done.vmaf(), done.crf(), done.processingDuration());
+                }
+
+                try (Stream<Path> pathStream = Files.list(gopDir)) {
+                    pathStream
+                        .filter(Files::isRegularFile)
+                        .forEach(path -> {
+                            try {
+                                Files.delete(path);
+                            } catch (IOException e) {
+                                throw new UncheckedIOException(e);
+                            }
+                        });
+                }
+
+                EncodingResult result = encodeMatchingTargetVmafUsingBinarySearch(range, input, probeResult, frameRate, encodingParams, targetVmaf, targetMinVmaf, gopDir, ffmpegPath);
+                try (Stream<Path> pathStream = Files.list(gopDir)) {
                     pathStream
                         .filter(Files::isRegularFile)
                         .filter(Predicate.not(result.file()::equals))
@@ -348,6 +525,33 @@ List<EncodingResult> encode(List<Range> ranges, String input, ProbeResult probeR
                             }
                         });
                 }
+
+                int encodingSize;
+                int encodingChecksum;
+                try (FileChannel channel = FileChannel.open(result.file(), StandardOpenOption.READ)) {
+                    encodingSize = Math.toIntExact(channel.size());
+                    MappedByteBuffer map = channel.map(FileChannel.MapMode.READ_ONLY, 0, encodingSize);
+                    Checksum checksum = crc32c();
+                    checksum.update(map);
+                    encodingChecksum = (int)(checksum.getValue());
+                }
+                ByteBuffer buf = ByteBuffer.allocate(40)
+                    .putInt(result.crf())
+                    .putDouble(result.vmaf().min())
+                    .putDouble(result.vmaf().mean())
+                    .putDouble(result.vmaf().harmonicMean())
+                    .putLong(result.processingDuration().toMillis());
+                Checksum checksum = crc32c();
+                checksum.update(buf);
+
+                Done done = new Done(encodingSize, encodingChecksum, result.processingDuration(), result.crf(), result.vmaf(), (int) checksum.getValue());
+                String doneString = OBJECT_MAPPER.writeValueAsString(done);
+                Files.writeString(
+                    doneFile,
+                    doneString,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING
+                );
+
                 return result;
             }));
         }
@@ -360,11 +564,13 @@ List<EncodingResult> encode(List<Range> ranges, String input, ProbeResult probeR
     return encodedScenes;
 }
 
-Path gopDir(EncoderName encoder, Range range, int targetVmaf) {
-    return Path.of("%s-range-%d-%d-vmaf%d".formatted(encoder, range.from(), range.to(), targetVmaf));
+Path gopDir(EncoderName encoder, String preset, Range range, int targetVmaf) {
+    return Path.of("%s-%s-range-%d-%d-vmaf%d".formatted(encoder, preset, range.from(), range.to(), targetVmaf));
 }
 
 EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String input, ProbeResult probeResult, Rational frameRate, EncodingParams encodingParams, int targetMeanVmaf, int targetMinVmaf, Path dir, String ffmpegPath) throws IOException, InterruptedException {
+    Instant start = Instant.now();
+
     EncoderName encoder = encodingParams.encoder();
     int l = encoder.effectiveCrfRange().from();
     int r = encoder.effectiveCrfRange().to();
@@ -379,7 +585,7 @@ EncodingResult encodeMatchingTargetVmafUsingBinarySearch(Range range, String inp
         double meanVmaf = iterationResult.vmaf().mean();
         double minVmaf = iterationResult.vmaf().min();
 
-        result = new EncodingResult(range, iterationResult.file(), iterationResult.vmaf(), crf);
+        result = new EncodingResult(range, iterationResult.file(), iterationResult.vmaf(), crf, Duration.between(start, Instant.now()));
 
         if (meanVmaf >= targetMeanVmaf + 1) {
             if (targetMinVmaf > 0 && minVmaf < targetMinVmaf) {
@@ -709,7 +915,7 @@ Rational rationalFromString(String rational) {
 
 void cleanup(List<Range> gops, EncodingParams encodingParams, int targetVmaf) throws IOException {
     for (Range gop : gops) {
-        Path gopDir = gopDir(encodingParams.encoder(), gop, targetVmaf);
+        Path gopDir = gopDir(encodingParams.encoder(), encodingParams.preset(), gop, targetVmaf);
         try (Stream<Path> contents = Files.list(gopDir)) {
             for (Path path : (Iterable<Path>) (contents::iterator)) {
                 Files.delete(path);
@@ -717,15 +923,27 @@ void cleanup(List<Range> gops, EncodingParams encodingParams, int targetVmaf) th
         }
         Files.delete(gopDir);
     }
+    Files.delete(Path.of(CONFIG_JSON));
 }
 
-void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String output, Duration processingDuration) throws IOException {
+void makeReport(Config config, List<EncodingResult> encodedGops, Rational frameRate, String output, Duration probeDuration, Duration sceneDetectionDuration, Duration encodingDuration, Duration concatDuration, Duration mergeDuration) throws IOException {
     record Report(
-        Duration processingDuration,
+        EncoderName encoder,
+        String preset,
+        int targetMeanVmaf,
+        int targetMinVmaf,
+        int targetGopInSeconds,
+        long probeDurationSeconds,
+        long sceneDetectionDurationSeconds,
+        long encodingDurationSeconds,
+        long concatDurationSeconds,
+        long mergeDurationSeconds,
         double minMeanVmaf,
         double meanMeanVmaf,
         double maxMeanVmaf,
         double minMinVmaf,
+        double meanMinVmaf,
+        double maxMinVmaf,
         int minBitrate,
         int meanBitrate,
         int maxBitrate,
@@ -743,9 +961,11 @@ void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String out
 
     double minMeanVmaf = encodedGops.getFirst().vmaf().mean();
     long meanVmafWeightedSum = 0;
-    long meanVmafWeightsSum = 0;
+    long weightsSum = 0;
     double maxMeanVmaf = encodedGops.getFirst().vmaf().mean();
     double minMinVmaf = encodedGops.getFirst().vmaf().min();
+    long minVmafWeightedSum = 0;
+    double maxMinVmaf = encodedGops.getFirst().vmaf().min();
     int minBitrate = bitrateKbs(encodedGops.getFirst().file(), encodedGops.getFirst().frames(), frameRate);
     int bitrateWeightedSum = bitrateKbs(encodedGops.getFirst().file(), encodedGops.getFirst().frames(), frameRate);
     int maxBitrate = bitrateKbs(encodedGops.getFirst().file(), encodedGops.getFirst().frames(), frameRate);
@@ -774,12 +994,16 @@ void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String out
             minMeanVmaf = vmaf.mean();
         }
         meanVmafWeightedSum += (long) (vmaf.mean() * frames.count());
-        meanVmafWeightsSum += frames.count();
+        weightsSum += frames.count();
         if (vmaf.mean() > maxMeanVmaf) {
             maxMeanVmaf = vmaf.mean();
         }
         if (vmaf.min() < minMinVmaf) {
             minMinVmaf = vmaf.min();
+        }
+        minVmafWeightedSum += (long) (vmaf.min() * frames.count());
+        if (vmaf.min() > maxMinVmaf) {
+            maxMinVmaf = vmaf.min();
         }
         if (bitrateKbs < minBitrate) {
             minBitrate = bitrateKbs;
@@ -803,13 +1027,24 @@ void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String out
     }
 
     Report report = new Report(
-        processingDuration,
+        config.encoder(),
+        config.preset(),
+        config.targetVmaf(),
+        config.targetMinVmaf(),
+        config.targetGopInSeconds(),
+        probeDuration.toSeconds(),
+        sceneDetectionDuration.toSeconds(),
+        encodingDuration.toSeconds(),
+        concatDuration.toSeconds(),
+        mergeDuration.toSeconds(),
         minMeanVmaf,
-        (double) meanVmafWeightedSum / meanVmafWeightsSum,
+        (double) meanVmafWeightedSum / weightsSum,
         maxMeanVmaf,
         minMinVmaf,
+        (double) minVmafWeightedSum / weightsSum,
+        maxMinVmaf,
         minBitrate,
-        (int) (bitrateWeightedSum / meanVmafWeightsSum),
+        (int) (bitrateWeightedSum / weightsSum),
         maxBitrate,
         minCrf,
         maxCrf,
@@ -820,8 +1055,7 @@ void makeReport(List<EncodingResult> encodedGops, Rational frameRate, String out
 
     Path path = Path.of(Strings.CS.removeEnd(output, ".mp4") + ".json");
 
-    new ObjectMapper()
-        .registerModule(new JavaTimeModule())
+    OBJECT_MAPPER
         .writeValue(path.toFile(), report);
 }
 
@@ -1019,6 +1253,30 @@ class CommandLineArgs {
     String ffmpegPath;
 }
 
+record Conf(Config config, int checksum, Instant date) {
+}
+
+record Config(
+    String input,
+    String output,
+    String avSceneChange,
+    int targetVmaf,
+    int targetMinVmaf,
+    int targetGopInSeconds,
+    EncoderName encoder,
+    String preset,
+    DeinterlaceAlgorithm deinterlaceAlgorithm,
+    DeinterlaceMode deinterlaceMode,
+    String deinterlaceModelPath,
+    int parallelism,
+    Duration fromTime,
+    Duration duration,
+    boolean denoise,
+    PixelFormat pixelFormat,
+    String ffmpegPath
+) {
+}
+
 enum EncoderName {
     X264(
         "libx264",
@@ -1108,6 +1366,7 @@ enum EncoderName {
         this.encoderSpecificParams = encoderSpecificParams;
     }
 
+    @JsonValue
     @Override
     public String toString() {
         return lib;
@@ -1154,6 +1413,7 @@ enum DeinterlaceAlgorithm {
         this.sendFieldMode = sendFieldMode;
     }
 
+    @JsonValue
     @Override
     public String toString() {
         return name().toLowerCase();
@@ -1172,6 +1432,7 @@ enum DeinterlaceMode {
     SEND_FIELD,
     ;
 
+    @JsonValue
     @Override
     public String toString() {
         return name().toLowerCase();
@@ -1248,7 +1509,10 @@ record Vmaf(@JsonProperty("pooled_metrics") Map<String, Agg> pooledMetrics) {
 record EncodingIterationResult(Path file, Vmaf.Agg vmaf) {
 }
 
-record EncodingResult(Range frames, Path file, Vmaf.Agg vmaf, int crf) {
+record EncodingResult(Range frames, Path file, Vmaf.Agg vmaf, int crf, Duration processingDuration) {
+}
+
+record Done(int encodingSize, int encodingChecksum, Duration processingDuration, int crf, Vmaf.Agg vmaf, int paramsChecksum) {
 }
 
 record Rational(long numerator, long denominator) {
@@ -1272,8 +1536,14 @@ enum PixelFormat {
     YUV420P10LE,
     ;
 
+    @JsonValue
     @Override
     public String toString() {
         return name().toLowerCase();
     }
 }
+
+public static final String CONFIG_JSON = "config.json";
+
+public static final ObjectMapper OBJECT_MAPPER = new ObjectMapper()
+    .registerModule(new JavaTimeModule());
