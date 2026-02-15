@@ -1280,7 +1280,7 @@ record Config(
 enum EncoderName {
     X264(
         "libx264",
-        "-crf", new Range(17, 51),
+        "-crf", new Range(15, 51),
         "-preset",
         Map.of(),
         "-x264-params",
@@ -1289,7 +1289,7 @@ enum EncoderName {
 
     X265(
         "libx265",
-        "-crf", new Range(17, 51),
+        "-crf", new Range(15, 51),
         "-preset",
         Map.of("-tag:v", "hvc1"),
         "-x265-params",
@@ -1298,7 +1298,7 @@ enum EncoderName {
 
     VPX_VP9(
         "libvpx-vp9",
-        "-crf", new Range(15, 63),
+        "-crf", new Range(13, 63),
         "-cpu-used",
         Map.of(
             "-deadline", "good",
@@ -1311,7 +1311,7 @@ enum EncoderName {
 
     SVT_AV1(
         "libsvtav1",
-        "-crf", new Range(16, 63),
+        "-crf", new Range(14, 63),
         "-preset",
         Map.of(),
         "-svtav1-params",
@@ -1323,7 +1323,7 @@ enum EncoderName {
 
     VV_ENC(
         "libvvenc",
-        "-qp", new Range(16, 63),
+        "-qp", new Range(14, 63),
         "-preset",
         Map.of(),
         "-vvenc-params",
